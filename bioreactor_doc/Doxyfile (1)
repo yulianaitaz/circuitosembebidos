@@ -1,0 +1,62 @@
+# ===========================================================
+#  Doxyfile — Bioreactor Fermentación Café ESP32
+#  Generado para uso con Doxygen 1.9+
+# ===========================================================
+
+PROJECT_NAME           = "Bioreactor Fermentación Café"
+PROJECT_NUMBER         = "v2.0"
+PROJECT_BRIEF          = "Sistema de monitoreo autónomo para fermentación de café - ESP32 / ESP-IDF"
+OUTPUT_DIRECTORY       = docs/
+
+# Idioma de salida
+OUTPUT_LANGUAGE        = Spanish
+
+# Archivos a documentar
+INPUT                  = main.c \
+                         sensores.c sensores.h \
+                         definiciones.h \
+                         dht.c dht.h \
+                         ds18b20.c ds18b20.h \
+                         ds1302.c ds1302.h \
+                         ph_sensor.c ph_sensor.h \
+                         ldr.c ldr.h \
+                         i2c_lcd.c i2c_lcd.h \
+                         rgb_control.c rgb_control.h \
+                         botones.c botones.h
+
+FILE_PATTERNS          = *.c *.h
+RECURSIVE              = NO
+
+# Formatos de salida
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+GENERATE_PDF           = NO
+
+# Opciones HTML
+HTML_OUTPUT            = html
+HTML_COLORSTYLE_HUE    = 220
+HTML_COLORSTYLE_SAT    = 100
+HTML_COLORSTYLE_GAMMA  = 80
+HTML_TIMESTAMP         = YES
+HTML_DYNAMIC_SECTIONS  = YES
+GENERATE_TREEVIEW      = YES
+
+# Incluir código fuente en la doc
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = YES
+STRIP_CODE_COMMENTS    = NO
+
+# Diagramas de llamadas (requiere Graphviz instalado)
+HAVE_DOT               = YES
+CALL_GRAPH             = YES
+CALLER_GRAPH           = YES
+DOT_IMAGE_FORMAT       = svg
+
+# Extracción completa (incluso sin @brief)
+EXTRACT_ALL            = YES
+EXTRACT_STATIC         = YES
+EXTRACT_PRIVATE        = YES
+
+# Advertencias
+WARN_IF_UNDOCUMENTED   = YES
+WARN_FORMAT            = "$file:$line: $text"
