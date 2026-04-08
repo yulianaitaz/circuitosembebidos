@@ -1,0 +1,1188 @@
+#ifndef DEFINICIONES_H
+#define DEFINICIONES_H
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "driver/i2c.h"
+
+#define LCD_SDA_GPIO    21
+#define LCD_SCL_GPIO    22
+#define I2C_MASTER_NUM  I2C_NUM_0
+#define I2C_FREQ_HZ     50000
+#define LCD_ADDR        0x27
+
+#define RTC_RST_GPIO    32
+#define RTC_DAT_GPIO    33
+#define RTC_CLK_GPIO    25
+
+#define SD_MOSI_GPIO    23
+#define SD_MISO_GPIO    19
+#define SD_SCK_GPIO     18
+#define SD_CS_GPIO      5
+
+#define PH_ADC_GPIO     36
+#define DHT_DATA_GPIO   4
+#define DS18B20_GPIO    16
+#define LDR_GPIO        17
+
+#define RGB_RED_GPIO    14  
+#define RGB_GREEN_GPIO  26
+#define RGB_BLUE_GPIO   27
+
+#define BOTON_INICIO    13  
+#define BOTON_MEZCLA    12  
+
+#define TEMP_MAX_CAFE       32.0    
+#define TEMP_MIN_CAFE       15.0    
+
+#define PH_MAX              4.5    
+#define PH_MIN              3.8    
+
+#define LUZ_MIN_REQUERIDA   0      
+
+#define TIEMPO_ALERTA_MAX   900      
+#define TIEMPO_LECTURA_PH   900      
+#define TIEMPO_MAX_PERSISTENCIA   900
+
+typedef struct {
+    float temperatura_aire;
+    float humedad_aire;
+    float temperatura_cafe;    
+    float valor_ph;
+    int nivel_luz;
+    char timestamp[32];
+    int codigo_alerta;
+} datos_fermentacion_t;
+
+typedef enum {
+    ESTADO_REPOSO,      
+    ESTADO_MONITOREO,  
+    ESTADO_ALERTA,      
+    ESTADO_ALARMA      
+} estado_sistema_t;
+
+extern QueueHandle_t g_cola_datos;
+extern SemaphoreHandle_t g_mutex_i2c;
+extern estado_sistema_t g_estado_sistema;
+
+#endif        
+idf_component_register(SRCS "main.c"
+                            "sensores.c"
+                            "ph_sensor.c"
+                            "botones.c"
+                            "rgb_control.c"
+                            "ds18b20.c"
+                            "dht.c"
+                            "ldr.c"
+                            "ds1302.c"
+                            "i2c_lcd.c"
+                       INCLUDE_DIRS ".")
+
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "definiciones.h"
+#include "botones.h"
+
+
+void botones_init(void) {
+    //incio
+    gpio_reset_pin(BOTON_INICIO);
+    gpio_set_direction(BOTON_INICIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOTON_INICIO, GPIO_PULLUP_ONLY);
+
+    //movimiento
+    gpio_reset_pin(BOTON_MEZCLA);
+    gpio_set_direction(BOTON_MEZCLA, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOTON_MEZCLA, GPIO_PULLUP_ONLY);
+
+    printf("[BOTONES] Inicio (GPIO %d) y Mezcla (GPIO %d) inicializados.\n",
+           BOTON_INICIO, BOTON_MEZCLA);
+}
+
+
+// inicio
+bool boton_inicio_presionado(void) {
+    // 0 = presionado (por pull-up)
+    if (gpio_get_level(BOTON_INICIO) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Antirrebote
+        if (gpio_get_level(BOTON_INICIO) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+// mezcla
+bool boton_mezcla_presionado(void) {
+    if (gpio_get_level(BOTON_MEZCLA) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(50)); // Antirrebote
+        if (gpio_get_level(BOTON_MEZCLA) == 0) {
+            return true;
+        }
+    }
+    return false;
+} 
+#ifndef BOTONES_H
+#define BOTONES_H
+
+#include <stdbool.h>
+
+// ===== INICIALIZACIÓN =====
+void botones_init(void);
+
+// ===== LECTURA DE BOTONES =====
+bool boton_inicio_presionado(void);
+bool boton_mezcla_presionado(void);
+
+#endif
+#include "dht.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+
+esp_err_t dht_read_data(int gpio_num, float *humedad, float *temperatura) {
+    uint8_t datos[5] = {0,0,0,0,0};
+    uint32_t timeout = 0;
+
+    // 1. SEÑAL DE INICIO 
+    gpio_set_direction(gpio_num, GPIO_MODE_OUTPUT);
+    gpio_set_level(gpio_num, 0);
+    esp_rom_delay_us(18000); // 18 ms (DHT22)
+    gpio_set_level(gpio_num, 1);
+    esp_rom_delay_us(40);
+    gpio_set_direction(gpio_num, GPIO_MODE_INPUT);
+
+    //  2. RESPUESTA DEL SENSOR 
+    timeout = 0;
+    while(gpio_get_level(gpio_num) == 1) {
+        if(timeout++ > 100) return ESP_FAIL;
+        esp_rom_delay_us(1);
+    }
+
+    timeout = 0;
+    while(gpio_get_level(gpio_num) == 0) {
+        if(timeout++ > 100) return ESP_FAIL;
+        esp_rom_delay_us(1);
+    }
+
+    timeout = 0;
+    while(gpio_get_level(gpio_num) == 1) {
+        if(timeout++ > 100) return ESP_FAIL;
+        esp_rom_delay_us(1);
+    }
+
+    // 3. LECTURA DE 40 BITS 
+    for(int i = 0; i < 40; i++) {
+        timeout = 0;
+
+        while(gpio_get_level(gpio_num) == 0) {
+            if(timeout++ > 100) return ESP_FAIL;
+            esp_rom_delay_us(1);
+        }
+
+        esp_rom_delay_us(30); // Determina si es 1 o 0
+
+        if(gpio_get_level(gpio_num) == 1) {
+            datos[i/8] |= (1 << (7 - (i%8)));
+
+            timeout = 0;
+            while(gpio_get_level(gpio_num) == 1) {
+                if(timeout++ > 100) return ESP_FAIL;
+                esp_rom_delay_us(1);
+            }
+        }
+    }
+
+    // validacion
+    if (datos[4] == ((datos[0] + datos[1] + datos[2] + datos[3]) & 0xFF)) {
+
+        *humedad = ((datos[0] << 8) | datos[1]) * 0.1;
+        *temperatura = (((datos[2] & 0x7F) << 8) | datos[3]) * 0.1;
+
+        if (datos[2] & 0x80) {
+            *temperatura *= -1;
+        }
+
+        return ESP_OK;
+    }
+
+    return ESP_FAIL;
+}
+#ifndef DHT_H
+#define DHT_H
+
+#include "esp_err.h"
+
+// Tipo de sensor (por si lo amplías después)
+#define DHT_TYPE_DHT22 1
+
+// ===== FUNCIÓN PRINCIPAL =====
+// Lee humedad (%) y temperatura (°C)
+esp_err_t dht_read_data(int gpio_num, float *humedad, float *temperatura);
+
+#endif
+
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+#include "ds18b20.h"
+
+
+// ===== RESET DEL BUS ONEWIRE =====
+static esp_err_t onewire_reset(int gpio_pin) {
+    gpio_set_direction(gpio_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(gpio_pin, 0);
+    esp_rom_delay_us(480);
+
+    gpio_set_direction(gpio_pin, GPIO_MODE_INPUT);
+    esp_rom_delay_us(70);
+
+    int nivel = gpio_get_level(gpio_pin);
+
+    esp_rom_delay_us(410);
+
+    return (nivel == 0) ? ESP_OK : ESP_FAIL;
+}
+
+
+// ===== ESCRIBIR UN BIT =====
+static void onewire_write_bit(int gpio_pin, int bit) {
+    gpio_set_direction(gpio_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(gpio_pin, 0);
+
+    if (bit) {
+        esp_rom_delay_us(6);
+        gpio_set_direction(gpio_pin, GPIO_MODE_INPUT);
+        esp_rom_delay_us(64);
+    } else {
+        esp_rom_delay_us(60);
+        gpio_set_direction(gpio_pin, GPIO_MODE_INPUT);
+        esp_rom_delay_us(10);
+    }
+}
+
+
+// ===== LEER UN BIT =====
+static int onewire_read_bit(int gpio_pin) {
+    int bit_leido = 0;
+
+    gpio_set_direction(gpio_pin, GPIO_MODE_OUTPUT);
+    gpio_set_level(gpio_pin, 0);
+    esp_rom_delay_us(6);
+
+    gpio_set_direction(gpio_pin, GPIO_MODE_INPUT);
+    esp_rom_delay_us(9);
+
+    bit_leido = gpio_get_level(gpio_pin);
+
+    esp_rom_delay_us(55);
+
+    return bit_leido;
+}
+
+
+// ===== ESCRIBIR UN BYTE =====
+static void onewire_write_byte(int gpio_pin, uint8_t dato) {
+    for (int i = 0; i < 8; i++) {
+        onewire_write_bit(gpio_pin, (dato >> i) & 1);
+    }
+}
+
+
+// ===== LEER UN BYTE =====
+static uint8_t onewire_read_byte(int gpio_pin) {
+    uint8_t dato = 0;
+
+    for (int i = 0; i < 8; i++) {
+        if (onewire_read_bit(gpio_pin)) {
+            dato |= (1 << i);
+        }
+    }
+
+    return dato;
+}
+
+
+// ===== INICIALIZACIÓN =====
+esp_err_t ds18b20_init(int gpio_num) {
+    gpio_config_t config_gpio = {
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pin_bit_mask = (1ULL << gpio_num)
+    };
+
+    return gpio_config(&config_gpio);
+}
+
+
+// ===== LECTURA DE TEMPERATURA =====
+esp_err_t ds18b20_leer_temp(int gpio_num, float *temperatura) {
+
+    if (onewire_reset(gpio_num) != ESP_OK) return ESP_FAIL;
+
+    onewire_write_byte(gpio_num, 0xCC); // Skip ROM
+    onewire_write_byte(gpio_num, 0x44); // Convert T
+
+    vTaskDelay(pdMS_TO_TICKS(800));
+
+    if (onewire_reset(gpio_num) != ESP_OK) return ESP_FAIL;
+
+    onewire_write_byte(gpio_num, 0xCC); // Skip ROM
+    onewire_write_byte(gpio_num, 0xBE); // Read Scratchpad
+
+    uint8_t lsb = onewire_read_byte(gpio_num);
+    uint8_t msb = onewire_read_byte(gpio_num);
+
+    int16_t valor_crudo = (msb << 8) | lsb;
+
+    *temperatura = (float)valor_crudo / 16.0;
+
+    return ESP_OK;
+}
+#ifndef DS18B20_H
+#define DS18B20_H
+
+#include "esp_err.h"
+
+//  INICIALIZACIÓN 
+esp_err_t ds18b20_init(int gpio_num);
+
+// LECTURA DE TEMPERATURA 
+esp_err_t ds18b20_leer_temp(int gpio_num, float *temperatura);
+
+#endif
+#include "ds1302.h"
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+
+
+//  PINES INTERNOS
+static int pin_clk, pin_dat, pin_rst;
+
+
+//ESCRITURA DE BYTE 
+static void ds1302_write_byte(uint8_t dato) {
+    gpio_set_direction(pin_dat, GPIO_MODE_OUTPUT);
+
+    for (int i = 0; i < 8; i++) {
+        gpio_set_level(pin_dat, (dato >> i) & 1);
+
+        esp_rom_delay_us(15);
+        gpio_set_level(pin_clk, 1);
+        esp_rom_delay_us(15);
+        gpio_set_level(pin_clk, 0);
+        esp_rom_delay_us(15);
+    }
+}
+
+
+// LECTURA DE BYTE
+static uint8_t ds1302_read_byte() {
+    uint8_t dato = 0;
+
+    gpio_set_direction(pin_dat, GPIO_MODE_INPUT);
+
+    for (int i = 0; i < 8; i++) {
+        gpio_set_level(pin_clk, 0);
+        esp_rom_delay_us(15);
+
+        if (gpio_get_level(pin_dat)) {
+            dato |= (1 << i);
+        }
+
+        gpio_set_level(pin_clk, 1);
+        esp_rom_delay_us(15);
+        gpio_set_level(pin_clk, 0);
+        esp_rom_delay_us(15);
+    }
+
+    return dato;
+}
+
+
+//  INICIALIZACIÓN 
+void ds1302_init(int clk, int dat, int rst) {
+    pin_clk = clk;
+    pin_dat = dat;
+    pin_rst = rst;
+
+    gpio_reset_pin(pin_clk);
+    gpio_set_direction(pin_clk, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(pin_dat);
+    gpio_set_direction(pin_dat, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(pin_rst);
+    gpio_set_direction(pin_rst, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(pin_rst, 0);
+    gpio_set_level(pin_clk, 0);
+}
+
+
+//  CONVERSIÓN BCD 
+static uint8_t bcd_a_decimal(uint8_t bcd) {
+    return ((bcd >> 4) * 10) + (bcd & 0x0F);
+}
+
+static uint8_t decimal_a_bcd(uint8_t dec) {
+    return ((dec / 10) << 4) | (dec % 10);
+}
+
+
+//LECTURA DE TIEMPO 
+void ds1302_leer_tiempo(rtc_tiempo_t *tiempo) {
+
+    rtc_tiempo_t tiempo_leido;
+
+    // Lectura del RTC
+    gpio_set_level(pin_rst, 1);
+    esp_rom_delay_us(15);
+
+    ds1302_write_byte(0xBF);
+
+    tiempo_leido.segundo = bcd_a_decimal(ds1302_read_byte() & 0x7F);
+    tiempo_leido.minuto  = bcd_a_decimal(ds1302_read_byte());
+    tiempo_leido.hora    = bcd_a_decimal(ds1302_read_byte());
+    tiempo_leido.dia     = bcd_a_decimal(ds1302_read_byte());
+    tiempo_leido.mes     = bcd_a_decimal(ds1302_read_byte());
+
+    ds1302_read_byte(); // día semana (no usado)
+
+    tiempo_leido.anio = bcd_a_decimal(ds1302_read_byte()) + 2000;
+
+    gpio_set_level(pin_rst, 0);
+
+
+    //  FILTRO DE VALIDEZ 
+    if (tiempo_leido.mes > 0 && tiempo_leido.mes <= 12 &&
+        tiempo_leido.dia > 0 && tiempo_leido.dia <= 31 &&
+        tiempo_leido.segundo < 60) {
+
+        *tiempo = tiempo_leido;
+    }
+    else {
+        // FALLA → SIMULACIÓN DE TIEMPO
+        tiempo->segundo += 5;
+
+        if (tiempo->segundo >= 60) {
+            tiempo->segundo -= 60;
+            tiempo->minuto++;
+
+            if (tiempo->minuto >= 60) {
+                tiempo->minuto = 0;
+                tiempo->hora++;
+            }
+        }
+    }
+}
+
+
+//AJUSTE DE TIEMPO 
+void ds1302_fijar_tiempo(rtc_tiempo_t *tiempo) {
+
+    gpio_set_level(pin_rst, 1);
+
+    ds1302_write_byte(0x8E);
+    ds1302_write_byte(0x00); // Unlock
+
+    gpio_set_level(pin_rst, 0);
+    esp_rom_delay_us(10);
+
+    gpio_set_level(pin_rst, 1);
+
+    ds1302_write_byte(0xBE); // Burst write
+
+    ds1302_write_byte(decimal_a_bcd(tiempo->segundo));
+    ds1302_write_byte(decimal_a_bcd(tiempo->minuto));
+    ds1302_write_byte(decimal_a_bcd(tiempo->hora));
+    ds1302_write_byte(decimal_a_bcd(tiempo->dia));
+    ds1302_write_byte(decimal_a_bcd(tiempo->mes));
+    ds1302_write_byte(0x01); // día semana
+    ds1302_write_byte(decimal_a_bcd(tiempo->anio % 100));
+    ds1302_write_byte(0x00);
+
+    gpio_set_level(pin_rst, 0);
+}
+#ifndef DS1302_H
+#define DS1302_H
+
+#include "esp_err.h"
+#include <stdint.h>
+
+// ESTRUCTURA DE TIEMPO 
+typedef struct {
+    uint8_t segundo;
+    uint8_t minuto;
+    uint8_t hora;
+    uint8_t dia;
+    uint8_t mes;
+    uint16_t anio;
+} rtc_tiempo_t;
+
+
+// FUNCIONES PRINCIPALES 
+void ds1302_init(int clk, int dat, int rst);
+
+void ds1302_leer_tiempo(rtc_tiempo_t *tiempo);
+
+void ds1302_fijar_tiempo(rtc_tiempo_t *tiempo);
+
+#endif 
+#include "i2c_lcd.h"
+#include "definiciones.h"
+#include "driver/i2c_master.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include <string.h>
+
+
+// ===== HANDLERS DEL BUS I2C =====
+static i2c_master_bus_handle_t bus_i2c_handle = NULL;
+static i2c_master_dev_handle_t lcd_i2c_handle = NULL;
+
+
+// ===== CONTROL DEL PCF8574 =====
+#define LCD_PIN_RS        0x01
+#define LCD_PIN_EN        0x04
+#define LCD_PIN_BACKLIGHT 0x08
+
+
+// ===== ENVÍO DE NIBBLE =====
+static esp_err_t lcd_enviar_nibble(uint8_t nibble, bool rs) {
+
+    uint8_t base_datos = LCD_PIN_BACKLIGHT | ((nibble & 0x0F) << 4);
+
+    if (rs) base_datos |= LCD_PIN_RS;
+
+    uint8_t secuencia[3];
+
+    secuencia[0] = base_datos;
+    secuencia[1] = base_datos | LCD_PIN_EN;
+    secuencia[2] = base_datos;
+
+    esp_err_t error = i2c_master_transmit(lcd_i2c_handle, secuencia, 3, 100);
+
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    return error;
+}
+
+
+
+static void lcd_enviar_byte(uint8_t valor, bool rs) {
+    lcd_enviar_nibble((valor >> 4) & 0x0F, rs);
+    lcd_enviar_nibble(valor & 0x0F, rs);
+}
+
+
+
+void lcd_send_cmd(uint8_t comando) {
+    lcd_enviar_byte(comando, false);
+    vTaskDelay(pdMS_TO_TICKS(2));
+}
+
+
+
+void lcd_send_data(uint8_t dato) {
+    lcd_enviar_byte(dato, true);
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+
+
+void lcd_init(void) {
+
+    //
+    i2c_master_bus_config_t config_bus = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
+        .scl_io_num = LCD_SCL_GPIO,
+        .sda_io_num = LCD_SDA_GPIO,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+
+    ESP_ERROR_CHECK(i2c_new_master_bus(&config_bus, &bus_i2c_handle));
+
+
+    // ---- CONFIGURACIÓN DEL DISPOSITIVO ----
+    i2c_device_config_t config_disp = {
+        .device_address = LCD_ADDR,
+        .scl_speed_hz = 10000,
+    };
+
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_i2c_handle, &config_disp, &lcd_i2c_handle));
+
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+
+    // secuencia de inicialización
+    for(int i = 0; i < 6; i++) {
+        lcd_enviar_nibble(0x03, false);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    lcd_enviar_nibble(0x02, false);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+
+    // ---- CONFIG FINAL ----
+    lcd_send_cmd(0x28); // 4 bits, 2 líneas
+    lcd_send_cmd(0x0C); // Display ON
+    lcd_send_cmd(0x06); // Cursor incrementa
+    lcd_send_cmd(0x01); // Limpiar
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+}
+
+
+// 
+void lcd_put_cur(int fila, int columna) {
+    uint8_t posicion = (fila == 0) ? (0x80 + columna) : (0xC0 + columna);
+    lcd_send_cmd(posicion);
+}
+
+
+// 
+void lcd_send_string(char *texto) {
+    while (*texto) {
+        lcd_send_data((uint8_t)*texto++);
+    }
+}
+
+
+// limppiar
+void lcd_clear(void) {
+    lcd_send_cmd(0x01);
+} 
+#ifndef I2C_LCD_H
+#define I2C_LCD_H
+
+#include <stdint.h>
+
+// ===== FUNCIONES PRINCIPALES =====
+
+// Inicializa la pantalla LCD
+void lcd_init(void);
+
+// Envía un comando al LCD (ej: limpiar pantalla, configurar)
+void lcd_send_cmd(uint8_t comando);
+
+// Envía un dato (carácter) al LCD
+void lcd_send_data(uint8_t dato);
+
+// Envía una cadena de texto completa
+void lcd_send_string(char *texto);
+
+// Posiciona el cursor (fila 0-1, columna 0-15)
+void lcd_put_cur(int fila, int columna);
+
+// Limpia la pantalla LCD
+void lcd_clear(void);
+
+#endif
+#include "ldr.h"
+#include "driver/gpio.h"
+
+
+// ===== INICIALIZACIÓN DEL LDR =====
+void ldr_init(int gpio_num) {
+    gpio_reset_pin(gpio_num);
+    gpio_set_direction(gpio_num, GPIO_MODE_INPUT);
+}
+
+
+// ===== LECTURA DEL ESTADO DE LUZ =====
+int ldr_leer_estado(int gpio_num) {
+    // Invertimos la lectura:
+    // 1 = hay luz
+    // 0 = no hay luz
+    return !gpio_get_level(gpio_num);
+}
+#ifndef LDR_H
+#define LDR_H
+
+#include "esp_err.h"
+
+// ===== INICIALIZACIÓN =====
+void ldr_init(int gpio_num);
+
+// ===== LECTURA DE ESTADO =====
+// Retorna:
+// 1 = hay luz
+// 0 = no hay luz
+int ldr_leer_estado(int gpio_num);
+
+#endif
+#include <stdio.h>
+#include "esp_adc/adc_oneshot.h"
+#include "esp_err.h"
+#include "ph_sensor.h"
+
+
+// ===== VARIABLES INTERNAS DEL ADC =====
+static adc_oneshot_unit_handle_t adc_handle;
+static bool adc_inicializado = false;
+
+
+// ===== INICIALIZACIÓN DEL SENSOR DE pH =====
+void ph_init(int gpio_num) {
+
+    adc_oneshot_unit_init_cfg_t config_adc = {
+        .unit_id = ADC_UNIT_1,
+    };
+
+    adc_oneshot_new_unit(&config_adc, &adc_handle);
+
+
+    adc_oneshot_chan_cfg_t config_canal = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten = ADC_ATTEN_DB_12,
+    };
+
+    // ⚠ Se usa canal 0 (GPIO36 normalmente)
+    adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &config_canal);
+
+    adc_inicializado = true;
+}
+
+
+// ===== LECTURA DEL pH =====
+float ph_leer(int gpio_num) {
+
+    if (!adc_inicializado) return 0.0;
+
+    int valor_adc = 0;
+
+    esp_err_t estado = adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &valor_adc);
+
+    if (estado == ESP_OK) {
+
+        // Conversión ADC → Voltaje
+        float voltaje = (valor_adc / 4095.0f) * 3.3f;
+
+        // Conversión Voltaje → pH (GENÉRICA)
+        float valor_ph = 3.5f * voltaje;
+
+        return valor_ph;
+    }
+    else {
+        return -1.0; // Error de lectura
+    }
+}
+#ifndef PH_SENSOR_H
+#define PH_SENSOR_H
+
+#include "esp_err.h"
+
+// ===== INICIALIZACIÓN =====
+void ph_init(int gpio_num);
+
+// ===== LECTURA DE pH =====
+// Retorna:
+// valor >= 0  → lectura válida
+// -1.0        → error de lectura
+float ph_leer(int gpio_num);
+
+#endif
+#include "rgb_control.h"
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+
+// ===== CONFIGURACIÓN DE PINES =====
+static int pin_rojo;
+static int pin_verde;
+static int pin_azul;
+
+
+// ===== INICIALIZACIÓN DEL LED RGB =====
+void rgb_init(int rojo, int verde, int azul) {
+
+    pin_rojo = rojo;
+    pin_verde = verde;
+    pin_azul = azul;
+
+    gpio_reset_pin(pin_rojo);
+    gpio_set_direction(pin_rojo, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(pin_verde);
+    gpio_set_direction(pin_verde, GPIO_MODE_OUTPUT);
+
+    gpio_reset_pin(pin_azul);
+    gpio_set_direction(pin_azul, GPIO_MODE_OUTPUT);
+
+    // Apagar todo al inicio
+    gpio_set_level(pin_rojo, 0);
+    gpio_set_level(pin_verde, 0);
+    gpio_set_level(pin_azul, 0);
+}
+
+
+// ===== APAGAR LED =====
+void rgb_apagar(void) {
+    gpio_set_level(pin_rojo, 0);
+    gpio_set_level(pin_verde, 0);
+    gpio_set_level(pin_azul, 0);
+}
+
+
+// ===== COLOR ROJO =====
+void rgb_rojo(void) {
+    gpio_set_level(pin_rojo, 1);
+    gpio_set_level(pin_verde, 0);
+    gpio_set_level(pin_azul, 0);
+}
+
+
+// ===== COLOR VERDE =====
+void rgb_verde(void) {
+    gpio_set_level(pin_rojo, 0);
+    gpio_set_level(pin_verde, 1);
+    gpio_set_level(pin_azul, 0);
+}
+
+
+// ===== COLOR AZUL =====
+void rgb_azul(void) {
+    gpio_set_level(pin_rojo, 0);
+    gpio_set_level(pin_verde, 0);
+    gpio_set_level(pin_azul, 1);
+}
+
+
+// ===== COLOR AMARILLO =====
+void rgb_amarillo(void) {
+    gpio_set_level(pin_rojo, 1);
+    gpio_set_level(pin_verde, 1);
+    gpio_set_level(pin_azul, 0);
+}
+#ifndef RGB_CONTROL_H
+#define RGB_CONTROL_H
+
+// ===== INICIALIZACIÓN =====
+void rgb_init(int rojo, int verde, int azul);
+
+// ===== CONTROL DE ESTADOS =====
+void rgb_apagar(void);
+
+void rgb_rojo(void);
+
+void rgb_verde(void);
+
+void rgb_azul(void);
+
+void rgb_amarillo(void);
+
+#endif
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "dht.h"
+#include "ds18b20.h"
+#include "ph_sensor.h"
+#include "ldr.h"
+#include "ds1302.h"
+#include "i2c_lcd.h"
+#include "rgb_control.h"
+
+
+
+float temperatura = 0;
+float humedad = 0;
+float temperatura_agua = 0;
+float ph = 0;
+int luz = 0;
+
+
+// ===== ESTADOS DEL SISTEMA =====
+static void evaluar_alertas() {
+
+    // 🔴 ALERTA CRÍTICA
+    if (ph < 5.5 || ph > 8.5 || temperatura > 35) {
+        rgb_rojo();
+        return;
+    }
+
+    // 🟡 ALERTA MEDIA
+    if (ph < 6.0 || ph > 8.0) {
+        rgb_amarillo();
+        return;
+    }
+
+    // 🟢 NORMAL
+    rgb_verde();
+}
+
+
+// ===== TAREA PRINCIPAL DE SENSORES =====
+void tarea_sensores(void *pvParameters) {
+
+    // ===== INICIALIZACIÓN =====
+    dht_init(PIN_DHT);
+    ds18b20_init(PIN_DS18B20);
+    ph_init(PIN_LDR); // (ADC fijo en driver)
+    ldr_init(PIN_LDR);
+
+    rgb_init(PIN_RGB_R, PIN_RGB_G, PIN_RGB_B);
+
+    lcd_init();
+
+    ds1302_init(PIN_RTC_CLK, PIN_RTC_DAT, PIN_RTC_RST);
+
+
+    while (1) {
+
+        // ===== LECTURA DHT =====
+        dht_read_data(PIN_DHT, &humedad, &temperatura);
+
+        // ===== LECTURA DS18B20 =====
+        ds18b20_leer_temp(PIN_DS18B20, &temperatura_agua);
+
+        // ===== LECTURA pH =====
+        ph = ph_leer(PIN_LDR);
+
+        // ===== LDR =====
+        luz = ldr_leer_estado(PIN_LDR);
+
+        // ===== RTC =====
+        rtc_tiempo_t tiempo;
+        ds1302_leer_tiempo(&tiempo);
+
+        // ===== ALERTAS =====
+        evaluar_alertas();
+
+
+        // ===== MOSTRAR EN LCD =====
+        lcd_clear();
+
+        lcd_put_cur(0, 0);
+        char linea1[16];
+        sprintf(linea1, "T:%.1f H:%.1f", temperatura, humedad);
+        lcd_send_string(linea1);
+
+        lcd_put_cur(1, 0);
+        char linea2[16];
+        sprintf(linea2, "pH:%.2f A:%.1f", ph, temperatura_agua);
+        lcd_send_string(linea2);
+
+
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+#include <stdio.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#include "driver/gpio.h"
+
+#include "definiciones.h"
+#include "sensores.h"
+#include "i2c_lcd.h"
+#include "rgb_control.h"
+#include "botones.h"
+
+
+// variables
+extern int seg_desde_ultima_mezcla;
+
+estado_sistema_t estado_actual_global = ESTADO_REPOSO;
+
+QueueHandle_t xColaDatos = NULL;
+SemaphoreHandle_t xMutexI2C = NULL;
+
+bool toggle_alerta = false;
+volatile bool mezcla_manual_hecha = false;
+
+
+// lcd
+void tarea_pantalla(void *pvParameters)
+{
+    datos_fermentacion_t d_cache = {0};
+    char l1[17], l2[17];
+
+    lcd_init();
+    lcd_clear();
+
+    while (1)
+    {
+        if (xQueueReceive(xColaDatos, &d_cache, 0) == pdTRUE)
+        {
+            if (mezcla_manual_hecha && d_cache.causa_alerta == 6)
+                d_cache.causa_alerta = 0;
+        }
+
+        if (estado_actual_global == ESTADO_REPOSO)
+        {
+            lcd_put_cur(0, 0); lcd_send_string("BIOREACTOR V2.0");
+            lcd_put_cur(1, 0); lcd_send_string("LISTO - POPAYAN");
+        }
+        else
+        {
+            snprintf(l1, 17, "T:%4.1fC H:%2.0f%% ", d_cache.temp_cafe, d_cache.hum_aire);
+            lcd_put_cur(0, 0);
+            lcd_send_string(l1);
+
+            if (d_cache.causa_alerta == 0)
+            {
+                snprintf(l2, 17, "pH:%4.2f L:%s  ",
+                         d_cache.ph_valor,
+                         d_cache.luz_nivel ? "ON " : "OFF");
+                lcd_put_cur(1, 0);
+                lcd_send_string(l2);
+            }
+            else
+            {
+                toggle_alerta = !toggle_alerta;
+                lcd_put_cur(1, 0);
+
+                if (toggle_alerta)
+                {
+                    switch (d_cache.causa_alerta)
+                    {
+                        case 1:  lcd_send_string("!! TEMP ALTA !!"); break;
+                        case 2:  lcd_send_string("!! TEMP BAJA !!"); break;
+                        case 3:  lcd_send_string("!! PH ALTO    !!"); break;
+                        case 4:  lcd_send_string("!! PH BAJO    !!"); break;
+                        case 5:  lcd_send_string("!! MUCHA LUZ !!"); break;
+                        case 6:  lcd_send_string("MEZCLAR+PULSAR "); break;
+                        case 10: lcd_send_string("T.BAJA + PH.BAJ"); break;
+                        case 11: lcd_send_string("T.BAJA + PH.ALT"); break;
+                        case 12: lcd_send_string("T.ALTA + PH.BAJ"); break;
+                        case 13: lcd_send_string("T.ALTA + PH.ALT"); break;
+                        case 20: lcd_send_string("T.BAJA + LUZ   "); break;
+                        case 21: lcd_send_string("T.BAJA + MEZCLA"); break;
+                        case 22: lcd_send_string("T.ALTA + LUZ   "); break;
+                        case 23: lcd_send_string("T.ALTA + MEZCLA"); break;
+                        case 24: lcd_send_string("PH.BAJ + LUZ   "); break;
+                        case 25: lcd_send_string("PH.BAJ + MEZCLA"); break;
+                        case 26: lcd_send_string("PH.ALT + LUZ   "); break;
+                        case 27: lcd_send_string("PH.ALT + MEZCLA"); break;
+                        case 28: lcd_send_string("LUZ + MEZCLA   "); break;
+                        case 99: lcd_send_string("ALARMA:REV. TODO"); break;
+                        default: lcd_send_string("ERROR NO DEF.  "); break;
+                    }
+                }
+                else
+                {
+                    snprintf(l2, 17, "pH:%4.2f L:%s  ",
+                             d_cache.ph_valor,
+                             d_cache.luz_nivel ? "ON " : "OFF");
+                    lcd_send_string(l2);
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+
+// control
+void tarea_control_proceso(void *pvParameters)
+{
+    datos_fermentacion_t datos_vivos;
+
+    int ticks_en_alerta = 0;
+    int toggle_visual = 0;
+
+    rgb_init();
+    botones_init();
+
+    while (1)
+    {
+        // BOTÓN MEZCLA
+        if (boton_mezcla_presionado())
+        {
+            seg_desde_ultima_mezcla = 0;
+            mezcla_manual_hecha = true;
+            ticks_en_alerta = 0;
+            printf("[SISTEMA] Mezcla manual.\n");
+        }
+
+        // ESTADO REPOSO
+        if (estado_actual_global == ESTADO_REPOSO)
+        {
+            color_verde();
+            if (boton_inicio_presionado())
+                estado_actual_global = ESTADO_MONITOREO;
+        }
+        else
+        {
+            if (xQueuePeek(xColaDatos, &datos_vivos, 0) == pdTRUE)
+            {
+                if (mezcla_manual_hecha && datos_vivos.causa_alerta == 6)
+                    datos_vivos.causa_alerta = 0;
+
+                if (datos_vivos.causa_alerta == 99)
+                {
+                    estado_actual_global = ESTADO_ALARMA;
+                }
+                else if (datos_vivos.causa_alerta > 0)
+                {
+                    ticks_en_alerta++;
+                    if (ticks_en_alerta >= (TIEMPO_MAX_PERSISTENCIA * 5))
+                        estado_actual_global = ESTADO_ALARMA;
+                    else
+                        estado_actual_global = ESTADO_ALERTA;
+                }
+                else
+                {
+                    estado_actual_global = ESTADO_MONITOREO;
+                    ticks_en_alerta = 0;
+
+                    if (seg_desde_ultima_mezcla < 5)
+                        mezcla_manual_hecha = false;
+                }
+            }
+
+            toggle_visual = !toggle_visual;
+
+            switch (estado_actual_global)
+            {
+                case ESTADO_MONITOREO: color_azul(); break;
+                case ESTADO_ALERTA:    toggle_visual ? color_amarillo() : color_azul(); break;
+                case ESTADO_ALARMA:     toggle_visual ? color_rojo() : color_azul(); break;
+                default:                color_verde(); break;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+
+
+void app_main(void)
+{
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    xColaDatos = xQueueCreate(1, sizeof(datos_fermentacion_t));
+    xMutexI2C  = xSemaphoreCreateMutex();
+
+    if (xColaDatos != NULL)
+    {
+        xTaskCreate(tarea_sensores, "TareaSensores", 4096, NULL, 5, NULL);
+        xTaskCreate(tarea_pantalla, "TareaPantalla", 4096, NULL, 5, NULL);
+        xTaskCreate(tarea_control_proceso, "TareaControl", 4096, NULL, 5, NULL);
+
+        printf("[INFO] Bioreactor Popayán listo.\n");
+    }
+}
